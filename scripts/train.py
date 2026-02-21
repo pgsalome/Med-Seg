@@ -375,6 +375,36 @@ def build_model(cfg: dict) -> torch.nn.Module:
     raise ValueError(f"Unknown model.name: {model_name}")
 
 
+def split_cases_patient_level(cases, cfg: dict):
+    grouped = {}
+    for case in cases:
+        grouped.setdefault(case.patient_id, []).append(case)
+
+    patient_ids = list(grouped.keys())
+    if len(patient_ids) < 2:
+        raise RuntimeError("Need at least 2 unique patients for train/val split.")
+
+    seed = int(cfg.get("seed", 1337))
+    val_fraction = float(cfg.get("train", {}).get("val_fraction", 0.2))
+    if not (0.0 < val_fraction < 1.0):
+        raise ValueError("train.val_fraction must be in (0, 1).")
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(patient_ids)
+
+    n_patients = len(patient_ids)
+    n_val_patients = max(1, int(round(val_fraction * n_patients)))
+    n_val_patients = min(n_patients - 1, n_val_patients)
+    val_patient_ids = set(patient_ids[:n_val_patients])
+
+    train_cases = [case for case in cases if case.patient_id not in val_patient_ids]
+    val_cases = [case for case in cases if case.patient_id in val_patient_ids]
+    if not train_cases or not val_cases:
+        raise RuntimeError("Patient-level split produced empty train or val set.")
+
+    return train_cases, val_cases, len(patient_ids) - n_val_patients, n_val_patients
+
+
 def main(cfg_path: str):
     cfg = load_config(cfg_path)
     cfg = ensure_training_registry(cfg, cfg_path)
@@ -394,9 +424,13 @@ def main(cfg_path: str):
     if len(cases) <= 10:
         raise RuntimeError("Too few cases after filtering. Need more than 10 cases.")
 
-    split_idx = max(1, int(0.8 * len(cases)))
-    train_cases = cases[:split_idx]
-    val_cases = cases[split_idx:] if split_idx < len(cases) else cases[-1:]
+    train_cases, val_cases, train_patients, val_patients = split_cases_patient_level(cases, cfg)
+    print(
+        "[split] patient-level split "
+        f"train_patients={train_patients} val_patients={val_patients} "
+        f"train_cases={len(train_cases)} val_cases={len(val_cases)} "
+        f"seed={int(cfg.get('seed', 1337))}"
+    )
 
     train_tfms = build_train_transforms(cfg)
     val_tfms = Compose([EnsureTyped(keys=["image", "label", "brain_mask"], track_meta=False)])
@@ -509,6 +543,7 @@ def main(cfg_path: str):
         train_lesion_n = 0
         train_num_outputs = 1
         printed_train_batch_info = False
+        printed_train_logits_info = False
         for batch in train_loader:
             x = batch["image"].to(device)
             y = batch["label"].to(device)
@@ -527,6 +562,13 @@ def main(cfg_path: str):
                 logits_out = model(x)
                 logits_list = _as_logits_list(logits_out)
                 train_num_outputs = len(logits_list)
+                if not printed_train_logits_info:
+                    print(
+                        f"[train][epoch {epoch}] "
+                        f"input_shape={tuple(x.shape)} "
+                        f"logits_shapes={[tuple(t.shape) for t in logits_list]}"
+                    )
+                    printed_train_logits_info = True
                 ds_weights = _resolve_deep_supervision_weights(cfg, len(logits_list))
                 loss = 0.0
                 for ds_idx, (logits_ds, ds_weight) in enumerate(zip(logits_list, ds_weights)):

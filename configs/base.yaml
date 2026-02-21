@@ -58,6 +58,7 @@ sampling:
 train:
   epochs: 300
   batch_size: 2
+  val_fraction: 0.2
   num_workers: 4
   lr: 3e-4
   weight_decay: 1e-4
