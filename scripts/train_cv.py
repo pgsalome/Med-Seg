@@ -7,6 +7,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 from monai.inferers import sliding_window_inference
 from monai.transforms import Compose, EnsureTyped
@@ -39,10 +40,13 @@ try:
         _make_grad_scaler,
         _parse_val_thresholds,
         _prepare_fixed_tracking_patch,
+        _as_logits_list,
+        _resolve_deep_supervision_weights,
         build_loss_fn,
         build_model,
         freeze_encoder,
         make_optimizer,
+        make_scheduler,
     )
 except ModuleNotFoundError:
     from train import (
@@ -51,10 +55,13 @@ except ModuleNotFoundError:
         _make_grad_scaler,
         _parse_val_thresholds,
         _prepare_fixed_tracking_patch,
+        _as_logits_list,
+        _resolve_deep_supervision_weights,
         build_loss_fn,
         build_model,
         freeze_encoder,
         make_optimizer,
+        make_scheduler,
     )
 
 
@@ -144,10 +151,10 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
     masked_bce_weight = float(masked_loss_cfg.get("bce_weight", 1.0))
     if use_masked_loss:
         loss_name = "masked_dice_bce"
-    train_dice_metric = make_dice_metric(include_background=True, reduction="mean")
+    train_dice_metric = make_dice_metric(include_background=False, reduction="mean")
     val_thresholds = _parse_val_thresholds(cfg)
     val_dice_metrics = {
-        float(thr): make_dice_metric(include_background=True, reduction="mean")
+        float(thr): make_dice_metric(include_background=False, reduction="mean")
         for thr in val_thresholds
     }
 
@@ -157,6 +164,11 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
     freeze_epochs = int(cfg["transfer"]["freeze_encoder_epochs"])
     freeze_encoder(model, True)
     optimizer = make_optimizer(cfg, model)
+    scheduler, scheduler_name = make_scheduler(
+        cfg,
+        optimizer,
+        total_epochs=int(cfg["train"]["epochs"]),
+    )
     spacing_zyx = None
     target_spacing = cfg.get("preprocess", {}).get("target_spacing")
     if target_spacing is not None and len(target_spacing) == 3:
@@ -195,6 +207,11 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
         if epoch == freeze_epochs:
             freeze_encoder(model, False)
             optimizer = make_optimizer(cfg, model)
+            scheduler, scheduler_name = make_scheduler(
+                cfg,
+                optimizer,
+                total_epochs=max(1, int(cfg["train"]["epochs"]) - epoch),
+            )
 
         train_loss = 0.0
         train_steps = 0
@@ -203,6 +220,7 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
         train_surface_n = 0
         train_lesion_sum = 0.0
         train_lesion_n = 0
+        train_num_outputs = 1
         printed_train_batch_info = False
         for batch in train_loader:
             x = batch["image"].to(device)
@@ -225,17 +243,31 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
 
             optimizer.zero_grad(set_to_none=True)
             with _autocast(device, enabled=use_amp):
-                logits = model(x)
-                if use_masked_loss:
-                    loss = masked_dice_bce_loss(
-                        logits,
-                        y,
-                        w,
-                        dice_weight=masked_dice_weight,
-                        bce_weight=masked_bce_weight,
-                    )
-                else:
-                    loss = loss_fn(logits, y)
+                logits_out = model(x)
+                logits_list = _as_logits_list(logits_out)
+                train_num_outputs = len(logits_list)
+                ds_weights = _resolve_deep_supervision_weights(cfg, len(logits_list))
+                loss = 0.0
+                for logits_ds, ds_weight in zip(logits_list, ds_weights):
+                    if float(ds_weight) <= 0.0:
+                        continue
+                    y_ds = y
+                    w_ds = w
+                    if logits_ds.shape[-3:] != y.shape[-3:]:
+                        y_ds = F.interpolate(y, size=logits_ds.shape[-3:], mode="nearest")
+                        w_ds = F.interpolate(w, size=logits_ds.shape[-3:], mode="nearest")
+                    if use_masked_loss:
+                        ds_loss = masked_dice_bce_loss(
+                            logits_ds,
+                            y_ds,
+                            w_ds,
+                            dice_weight=masked_dice_weight,
+                            bce_weight=masked_bce_weight,
+                        )
+                    else:
+                        ds_loss = loss_fn(logits_ds, y_ds)
+                    loss = loss + float(ds_weight) * ds_loss
+                logits = logits_list[0]
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -376,6 +408,10 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
             "val/gt_fg_ratio": gt_fg_ratio,
             "val/pred_to_gt_fg": pred_to_gt_fg,
             "train/loss_name": loss_name,
+            "train/deep_supervision_outputs": int(train_num_outputs),
+            "train/scheduler": scheduler_name,
+            "train/lr_encoder": float(optimizer.param_groups[0]["lr"]),
+            "train/lr_head": float(optimizer.param_groups[-1]["lr"]),
         }
         for thr, score in val_dice_by_thr.items():
             log_payload[f"val/dice@{thr:.2f}"] = float(score)
@@ -404,7 +440,8 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
             f"val_dice={val_dice:.4f} "
             f"val_best_thr={best_val_thr:.2f} "
             f"val_surface={val_surface_dice:.4f} "
-            f"val_lesion_recall={val_lesion_recall:.4f}"
+            f"val_lesion_recall={val_lesion_recall:.4f} "
+            f"lr_head={float(optimizer.param_groups[-1]['lr']):.2e}"
         )
         print(
             f"[fold {fold_idx}][scalar][epoch {epoch}] "
@@ -448,6 +485,9 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
             if bad_epochs >= patience:
                 print(f"[fold {fold_idx}] early stopping.")
                 break
+
+        if scheduler is not None:
+            scheduler.step()
 
     wandb.finish()
     fold_history_path = os.path.join(checkpoint_dir, "fold_history.json")

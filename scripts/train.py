@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss, DiceFocalLoss, TverskyLoss
@@ -153,6 +154,42 @@ def make_optimizer(cfg: dict, model: torch.nn.Module):
     )
 
 
+def make_scheduler(cfg: dict, optimizer: torch.optim.Optimizer, total_epochs: int):
+    sched_cfg = cfg.get("train", {}).get("scheduler", {})
+    name = str(sched_cfg.get("name", "cosine")).strip().lower()
+    total_epochs = max(1, int(total_epochs))
+
+    if name in {"none", "off", "disabled"}:
+        return None, "none"
+
+    min_lr = float(sched_cfg.get("min_lr", 1e-6))
+    if name == "cosine":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=total_epochs,
+            eta_min=min_lr,
+        )
+        return sched, "cosine"
+
+    if name in {"poly", "polynomial"}:
+        power = float(sched_cfg.get("power", 0.9))
+        base_lrs = [float(g["lr"]) for g in optimizer.param_groups]
+        lambdas = []
+        for base_lr in base_lrs:
+            min_factor = float(min_lr / max(base_lr, 1e-12))
+
+            def _poly_lambda(epoch_idx, min_factor=min_factor, power=power):
+                progress = min(max((float(epoch_idx) + 1.0) / float(total_epochs), 0.0), 1.0)
+                factor = (1.0 - progress) ** power
+                return max(factor, min_factor)
+
+            lambdas.append(_poly_lambda)
+        sched = torch.optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambdas)
+        return sched, "poly"
+
+    raise ValueError("train.scheduler.name must be one of: ['none', 'cosine', 'poly']")
+
+
 def _safe_torch_load(path: str, map_location: str = "cpu"):
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
@@ -229,6 +266,33 @@ def _parse_val_thresholds(cfg: dict):
     return sorted(set(float(v) for v in thresholds))
 
 
+def _as_logits_list(logits):
+    if isinstance(logits, (list, tuple)):
+        return list(logits)
+    return [logits]
+
+
+def _resolve_deep_supervision_weights(cfg: dict, n_outputs: int):
+    n_outputs = max(1, int(n_outputs))
+    ds_cfg = cfg.get("train", {}).get("deep_supervision", {})
+    enabled = bool(ds_cfg.get("enabled", False))
+    if (not enabled) or n_outputs <= 1:
+        return [1.0] + [0.0] * (n_outputs - 1)
+
+    raw_weights = ds_cfg.get("weights")
+    if isinstance(raw_weights, (list, tuple)) and len(raw_weights) > 0:
+        weights = [max(0.0, float(v)) for v in raw_weights[:n_outputs]]
+        if len(weights) < n_outputs:
+            weights.extend([0.0] * (n_outputs - len(weights)))
+    else:
+        weights = [1.0 / (2.0**i) for i in range(n_outputs)]
+
+    total = float(sum(weights))
+    if total <= 0.0:
+        return [1.0] + [0.0] * (n_outputs - 1)
+    return [float(w / total) for w in weights]
+
+
 def build_loss_fn(cfg: dict):
     loss_cfg = cfg.get("train", {}).get("loss", {})
     if isinstance(loss_cfg, str):
@@ -272,18 +336,33 @@ def build_model(cfg: dict) -> torch.nn.Module:
     in_channels = int(cfg["model"]["in_channels"])
     out_channels = int(cfg["model"]["out_channels"])
     model_name = cfg["model"]["name"]
+    ds_cfg = cfg.get("train", {}).get("deep_supervision", {})
+    ds_enabled = bool(ds_cfg.get("enabled", False))
+    ds_num_outputs = int(ds_cfg.get("num_outputs", 4))
 
     if model_name == "triad_plain_unet":
         encoder = build_triad_plain_encoder(in_channels=in_channels)
         ckpt_path = cfg["model"]["triad"]["plain_ckpt"]
         encoder.load_state_dict(_load_state_dict(ckpt_path), strict=True)
-        return EncoderToSegModel(encoder, "triad_plain", out_channels=out_channels)
+        return EncoderToSegModel(
+            encoder,
+            "triad_plain",
+            out_channels=out_channels,
+            deep_supervision=ds_enabled,
+            num_deep_supervision_outputs=ds_num_outputs,
+        )
 
     if model_name == "triad_swinb":
         encoder = TriadSwinEncoder(in_channels=in_channels)
         ckpt_path = cfg["model"]["triad"]["swinb_ckpt"]
         encoder.load_state_dict(_load_state_dict(ckpt_path), strict=True)
-        return EncoderToSegModel(encoder, "triad_swin", out_channels=out_channels)
+        return EncoderToSegModel(
+            encoder,
+            "triad_swin",
+            out_channels=out_channels,
+            deep_supervision=ds_enabled,
+            num_deep_supervision_outputs=ds_num_outputs,
+        )
 
     if model_name == "brainiac":
         brainiac_cfg = cfg["model"]["brainiac"]
@@ -363,10 +442,10 @@ def main(cfg_path: str):
     masked_bce_weight = float(masked_loss_cfg.get("bce_weight", 1.0))
     if use_masked_loss:
         loss_name = "masked_dice_bce"
-    train_dice_metric = make_dice_metric(include_background=True, reduction="mean")
+    train_dice_metric = make_dice_metric(include_background=False, reduction="mean")
     val_thresholds = _parse_val_thresholds(cfg)
     val_dice_metrics = {
-        float(thr): make_dice_metric(include_background=True, reduction="mean")
+        float(thr): make_dice_metric(include_background=False, reduction="mean")
         for thr in val_thresholds
     }
 
@@ -376,6 +455,11 @@ def main(cfg_path: str):
     freeze_epochs = int(cfg["transfer"]["freeze_encoder_epochs"])
     freeze_encoder(model, True)
     optimizer = make_optimizer(cfg, model)
+    scheduler, scheduler_name = make_scheduler(
+        cfg,
+        optimizer,
+        total_epochs=int(cfg["train"]["epochs"]),
+    )
     spacing_zyx = None
     target_spacing = cfg.get("preprocess", {}).get("target_spacing")
     if target_spacing is not None and len(target_spacing) == 3:
@@ -410,6 +494,11 @@ def main(cfg_path: str):
         if epoch == freeze_epochs:
             freeze_encoder(model, False)
             optimizer = make_optimizer(cfg, model)
+            scheduler, scheduler_name = make_scheduler(
+                cfg,
+                optimizer,
+                total_epochs=max(1, int(cfg["train"]["epochs"]) - epoch),
+            )
 
         train_loss = 0.0
         num_batches = 0
@@ -418,6 +507,7 @@ def main(cfg_path: str):
         train_surface_n = 0
         train_lesion_sum = 0.0
         train_lesion_n = 0
+        train_num_outputs = 1
         printed_train_batch_info = False
         for batch in train_loader:
             x = batch["image"].to(device)
@@ -434,17 +524,31 @@ def main(cfg_path: str):
 
             optimizer.zero_grad(set_to_none=True)
             with _autocast(device, enabled=use_amp):
-                logits = model(x)
-                if use_masked_loss:
-                    loss = masked_dice_bce_loss(
-                        logits,
-                        y,
-                        w,
-                        dice_weight=masked_dice_weight,
-                        bce_weight=masked_bce_weight,
-                    )
-                else:
-                    loss = loss_fn(logits, y)
+                logits_out = model(x)
+                logits_list = _as_logits_list(logits_out)
+                train_num_outputs = len(logits_list)
+                ds_weights = _resolve_deep_supervision_weights(cfg, len(logits_list))
+                loss = 0.0
+                for ds_idx, (logits_ds, ds_weight) in enumerate(zip(logits_list, ds_weights)):
+                    if float(ds_weight) <= 0.0:
+                        continue
+                    y_ds = y
+                    w_ds = w
+                    if logits_ds.shape[-3:] != y.shape[-3:]:
+                        y_ds = F.interpolate(y, size=logits_ds.shape[-3:], mode="nearest")
+                        w_ds = F.interpolate(w, size=logits_ds.shape[-3:], mode="nearest")
+                    if use_masked_loss:
+                        ds_loss = masked_dice_bce_loss(
+                            logits_ds,
+                            y_ds,
+                            w_ds,
+                            dice_weight=masked_dice_weight,
+                            bce_weight=masked_bce_weight,
+                        )
+                    else:
+                        ds_loss = loss_fn(logits_ds, y_ds)
+                    loss = loss + float(ds_weight) * ds_loss
+                logits = logits_list[0]
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -579,6 +683,10 @@ def main(cfg_path: str):
             "val/gt_fg_ratio": gt_fg_ratio,
             "val/pred_to_gt_fg": pred_to_gt_fg,
             "train/loss_name": loss_name,
+            "train/deep_supervision_outputs": int(train_num_outputs),
+            "train/scheduler": scheduler_name,
+            "train/lr_encoder": float(optimizer.param_groups[0]["lr"]),
+            "train/lr_head": float(optimizer.param_groups[-1]["lr"]),
         }
         for thr, score in val_dice_by_thr.items():
             log_payload[f"val/dice@{thr:.2f}"] = float(score)
@@ -607,7 +715,8 @@ def main(cfg_path: str):
             f"val_dice={val_dice:.4f} "
             f"val_best_thr={best_val_thr:.2f} "
             f"val_surface={val_surface_dice:.4f} "
-            f"val_lesion_recall={val_lesion_recall:.4f}"
+            f"val_lesion_recall={val_lesion_recall:.4f} "
+            f"lr_head={float(optimizer.param_groups[-1]['lr']):.2e}"
         )
         print(
             f"[scalar][epoch {epoch}] "
@@ -641,6 +750,9 @@ def main(cfg_path: str):
             if bad_epochs >= patience:
                 print("Early stopping.")
                 break
+
+        if scheduler is not None:
+            scheduler.step()
 
     wandb.finish()
 

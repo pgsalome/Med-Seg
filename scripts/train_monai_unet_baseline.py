@@ -25,6 +25,10 @@ from medseg.losses import masked_dice_bce_loss
 from medseg.metrics import make_dice_metric
 from medseg.registry_build import ensure_training_registry
 from medseg.utils import set_seed
+try:
+    from scripts.train import make_scheduler
+except ModuleNotFoundError:
+    from train import make_scheduler
 
 
 def _make_grad_scaler(device: torch.device, enabled: bool):
@@ -132,16 +136,17 @@ def main(cfg_path: str, epochs: int, early_stop_patience: int = 0):
     use_masked_loss = bool(masked_loss_cfg.get("enabled", True))
     masked_dice_weight = float(masked_loss_cfg.get("dice_weight", 1.0))
     masked_bce_weight = float(masked_loss_cfg.get("bce_weight", 1.0))
-    train_dice_metric = make_dice_metric(include_background=True, reduction="mean")
+    train_dice_metric = make_dice_metric(include_background=False, reduction="mean")
     val_thresholds = _parse_val_thresholds(cfg)
     val_dice_metrics = {
-        float(thr): make_dice_metric(include_background=True, reduction="mean")
+        float(thr): make_dice_metric(include_background=False, reduction="mean")
         for thr in val_thresholds
     }
 
     lr = float(cfg["train"]["lr"])
     weight_decay = float(cfg["train"]["weight_decay"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler, scheduler_name = make_scheduler(cfg, optimizer, total_epochs=int(epochs))
 
     use_amp = bool(cfg["train"]["amp"]) and device.type == "cuda"
     scaler = _make_grad_scaler(device, enabled=use_amp)
@@ -257,6 +262,8 @@ def main(cfg_path: str, epochs: int, early_stop_patience: int = 0):
             "val/best_threshold": float(best_val_thr),
             "val/mode": "full_volume_sliding_window",
             "train/model": "monai_unet_baseline_scratch",
+            "train/scheduler": scheduler_name,
+            "train/lr": float(optimizer.param_groups[0]["lr"]),
         }
         for thr, score in val_dice_by_thr.items():
             log_payload[f"val/dice@{thr:.2f}"] = float(score)
@@ -266,7 +273,8 @@ def main(cfg_path: str, epochs: int, early_stop_patience: int = 0):
             f"train_loss={train_loss_mean:.4f} "
             f"train_dice={train_dice:.4f} "
             f"val_dice={val_dice:.4f} "
-            f"val_best_thr={best_val_thr:.2f}"
+            f"val_best_thr={best_val_thr:.2f} "
+            f"lr={float(optimizer.param_groups[0]['lr']):.2e}"
         )
         print(
             f"[baseline-unet][scalar][epoch {epoch}] "
@@ -296,6 +304,9 @@ def main(cfg_path: str, epochs: int, early_stop_patience: int = 0):
             if early_stop_patience > 0 and bad_epochs >= early_stop_patience:
                 print("[baseline-unet] early stopping.")
                 break
+
+        if scheduler is not None:
+            scheduler.step()
 
     wandb.finish()
 

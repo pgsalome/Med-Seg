@@ -17,18 +17,20 @@ if SRC not in sys.path:
 
 from medseg.config import load_config
 try:
-    from scripts.train import main as train_main
+    from scripts.train_cv import main as train_cv_main
 except ModuleNotFoundError:
-    from train import main as train_main
+    from train_cv import main as train_cv_main
 
 
-def objective(trial: optuna.Trial, base_cfg: dict):
+def objective(trial: optuna.Trial, base_cfg: dict, folds: int):
     cfg = copy.deepcopy(base_cfg)
 
     trial_budget_epochs = trial.suggest_int("trial_epochs", 80, 120)
     min_bg = 0.10
     cfg.setdefault("metrics", {})
     cfg["metrics"]["val_thresholds"] = [0.3, 0.4, 0.5, 0.6]
+    cfg.setdefault("validation", {})
+    cfg["validation"]["sw_overlap"] = 0.5
     # Tightened search space based on recent sweeps:
     # better runs favored higher fg sampling, lower bg,
     # moderate-high lr, and lower weight decay.
@@ -39,7 +41,7 @@ def objective(trial: optuna.Trial, base_cfg: dict):
         "encoder_lr_mult", 0.08, 0.25, log=True
     )
     cfg["transfer"]["freeze_encoder_epochs"] = trial.suggest_int(
-        "freeze_encoder_epochs", 10, 40
+        "freeze_encoder_epochs", 5, 10
     )
 
     p_fg = trial.suggest_float("p_fg", 0.70, 0.82)
@@ -68,9 +70,7 @@ def objective(trial: optuna.Trial, base_cfg: dict):
     if not isinstance(loss_cfg, dict):
         loss_cfg = {}
         cfg["train"]["loss"] = loss_cfg
-    cfg["train"]["loss"]["name"] = trial.suggest_categorical(
-        "loss_name", ["dicece", "focaltversky", "dicefocal"]
-    )
+    cfg["train"]["loss"]["name"] = "dicefocal"
 
     cfg["augment"]["intensity"]["gamma_prob"] = trial.suggest_float("gamma_prob", 0.25, 0.50)
     cfg["augment"]["intensity"]["noise_prob"] = trial.suggest_float("noise_prob", 0.10, 0.30)
@@ -91,25 +91,26 @@ def objective(trial: optuna.Trial, base_cfg: dict):
     cfg["wandb"]["tags"] = cfg["wandb"].get("tags", []) + ["optuna"]
 
     checkpoint_dir = cfg.get("output", {}).get("checkpoint_dir", "checkpoints")
-    model_tag = cfg["model"]["name"]
-    metric_path = os.path.join(checkpoint_dir, f"best_metric_{model_tag}.json")
-    if os.path.exists(metric_path):
-        os.remove(metric_path)
+    summary_path = os.path.join(checkpoint_dir, "cv_summary.json")
+    if os.path.exists(summary_path):
+        os.remove(summary_path)
 
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
         yaml.safe_dump(cfg, tmp)
         tmp_cfg_path = tmp.name
 
     try:
-        train_main(tmp_cfg_path)
+        train_cv_main(tmp_cfg_path, folds=int(folds))
     finally:
         if os.path.exists(tmp_cfg_path):
             os.unlink(tmp_cfg_path)
 
-    if os.path.exists(metric_path):
-        with open(metric_path, "r", encoding="utf-8") as file:
-            best = json.load(file).get("best_val_dice", 0.0)
-        return float(best)
+    if os.path.exists(summary_path):
+        with open(summary_path, "r", encoding="utf-8") as file:
+            summary = json.load(file)
+        best = float(summary.get("mean_best_val_dice", 0.0))
+        trial.set_user_attr("cv_std_best_val_dice", float(summary.get("std_best_val_dice", 0.0)))
+        return best
     return 0.0
 
 
@@ -117,6 +118,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg", required=True)
     parser.add_argument("--trials", type=int, default=25)
+    parser.add_argument("--folds", type=int, default=5)
     args = parser.parse_args()
 
     base_cfg = load_config(args.cfg)
@@ -124,7 +126,7 @@ def main():
     sampler = optuna.samplers.TPESampler(seed=seed)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     study.optimize(
-        lambda trial: objective(trial, base_cfg),
+        lambda trial: objective(trial, base_cfg, folds=int(args.folds)),
         n_trials=args.trials,
         catch=(RuntimeError, ValueError),
     )

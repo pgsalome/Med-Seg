@@ -64,13 +64,24 @@ train:
   amp: true
   grad_clip: 1.0
   early_stop_patience: 50
+  scheduler:
+    name: "cosine"  # options: "none" | "cosine" | "poly"
+    min_lr: 1e-6
+    power: 0.9       # used only by "poly"
+  deep_supervision:
+    enabled: true
+    num_outputs: 4
+    weights: null    # optional list, e.g. [0.6, 0.25, 0.1, 0.05]
   masked_loss:
     enabled: true
     dice_weight: 1.0
     bce_weight: 1.0
 
+validation:
+  sw_overlap: 0.5
+
 transfer:
-  freeze_encoder_epochs: 30
+  freeze_encoder_epochs: 10
   encoder_lr_mult: 0.1
 
 model:
