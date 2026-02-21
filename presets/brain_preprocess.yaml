@@ -1,0 +1,25 @@
+preprocess:
+  preset_name: "brain"
+  background_value: -5.0
+  orient: "RAS"
+  target_spacing: [1.0, 1.0, 1.5]
+  n4_bias_correction:
+    shrink_factor: 2
+    num_iters: [50, 50, 30, 20]
+  crop:
+    enabled: true
+    margin_vox: 8
+    apply_brain_mask: true
+    background_value: -5.0
+    brain_mask:
+      method: "hdbet"
+      hdbet_cmd: "hd-bet"
+      hdbet_mode: "accurate"
+      hdbet_device: "cpu"
+      hdbet_tta: 0
+      hdbet_postprocess: 1
+      required: true
+      fallback_to_simple: false
+  intensity:
+    clip_percentiles: [0.1, 99.9]
+    normalization_mode: "minmax"  # options: "zscore" | "minmax"

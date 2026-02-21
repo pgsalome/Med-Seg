@@ -1,0 +1,20 @@
+inherits:
+  - "./base.yaml"
+  - "../presets/brain_preprocess.yaml"
+  - "../presets/brain_augment.yaml"
+
+wandb:
+  run_name: "triad-plain-brain-preregistry"
+
+data:
+  registry_json: "registries/mgh_registry.json"
+  image_key: "FU1_CT1_reg"
+  mask_key: "RN"
+  mask_id_key: "FU1_lesion_id"
+  id_keys: ["patient_id", "label_id"]
+
+registry_local:
+  auto_build: false
+
+model:
+  name: "triad_plain_unet"

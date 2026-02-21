@@ -1,0 +1,10 @@
+inherits:
+  - "./base.yaml"
+  - "../presets/brain_preprocess.yaml"
+  - "../presets/brain_augment.yaml"
+
+wandb:
+  run_name: "brainiac-brain"
+
+model:
+  name: "brainiac"

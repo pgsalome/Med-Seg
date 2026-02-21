@@ -1,0 +1,13 @@
+torch
+torchvision
+monai
+nibabel
+SimpleITK
+numpy
+scipy
+matplotlib
+pyyaml
+tqdm
+wandb
+optuna
+dynamic-network-architectures

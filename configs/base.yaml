@@ -1,0 +1,88 @@
+seed: 1337
+device: "cuda"
+
+wandb:
+  project: "rn-seg"
+  entity: null
+  tags: ["brain", "rn", "segmentation"]
+  mode: "online"
+  run_name: "run"
+
+data:
+  registry_json: "registries/registry.local.json"
+  image_key: "IMG"
+  mask_key: "mask"
+  site_key: "site_group"
+  id_keys: ["patient_id", "label_id"]
+
+  require_mask: true
+  use_test_flag: true
+  test_flag_field: "test"
+  keep_test_value: 0
+
+registry_local:
+  auto_build: true
+  source_cfg: "configs/experiment_triad_plain_preregistry.yaml"
+  output_path: "registries/registry.local.json"
+  rebuild_each_run: true
+  label_id_field: null
+  mask_id_key: null
+  label_id_default: 1
+  label_id_key: "label_id"
+
+uncertainty:
+  method: "tta"
+  tta_preset: "presets/brain_tta.yaml"
+  mc_n: 20
+
+cache:
+  enabled: true
+  cache_dir: "cache"
+  overwrite: false
+
+sampling:
+  patch_size: [96, 160, 160]
+  p_fg: 0.70
+  p_hardneg: 0.20
+  p_bg: 0.10
+  min_brain_frac: 0.60
+  max_brain_resample_tries: 16
+  component_sampling:
+    enabled: true
+    small_component_max_vox: 300
+    small_component_oversample_prob: 0.75
+  hardneg:
+    bright_percentile: 95.0
+    min_dist_to_lesion_vox: 5
+
+train:
+  epochs: 300
+  batch_size: 2
+  num_workers: 4
+  lr: 3e-4
+  weight_decay: 1e-4
+  amp: true
+  grad_clip: 1.0
+  early_stop_patience: 50
+  masked_loss:
+    enabled: true
+    dice_weight: 1.0
+    bce_weight: 1.0
+
+transfer:
+  freeze_encoder_epochs: 30
+  encoder_lr_mult: 0.1
+
+model:
+  name: "triad_plain_unet"
+  in_channels: 1
+  out_channels: 1
+  triad:
+    plain_ckpt: "/home/pgsalome/projects/git/Med-Seg/checkpoints/triad/Triad_PlainConvUNet.pth"
+    swinb_ckpt: "/path/to/Triad_SwinB.pth"
+  brainiac:
+    repo_root: "/path/to/BrainIAC"
+    checkpoint_path: "/path/to/brainiac.pth"
+
+output:
+  checkpoint_dir: "checkpoints"

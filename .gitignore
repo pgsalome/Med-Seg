@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+.DS_Store
+checkpoints/
+wandb/
+cache/
+*.npz
+*.pth
+*.pt
+*.ckpt
+registries/*.local.json
+registries/mgh_registry.json
+._*

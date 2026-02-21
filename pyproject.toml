@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "med-seg"
+version = "0.1.0"
+description = "Modular medical segmentation framework"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Med-Seg Contributors" }]
+dependencies = [
+  "torch",
+  "torchvision",
+  "monai",
+  "nibabel",
+  "SimpleITK",
+  "numpy",
+  "scipy",
+  "matplotlib",
+  "pyyaml",
+  "tqdm",
+  "wandb",
+  "optuna",
+  "dynamic-network-architectures",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

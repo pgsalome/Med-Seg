@@ -1,0 +1,10 @@
+[
+  {
+    "patient_id": "010024",
+    "site_group": "MOLAB",
+    "IMG": "/absolute/path/to/image.nii.gz",
+    "mask": "/absolute/path/to/mask.nii.gz",
+    "label_id": 1,
+    "test": 0
+  }
+]

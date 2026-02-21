@@ -1,0 +1,9 @@
+tta:
+  preset_name: "brain_safe_v1"
+  transforms:
+    - {type: "identity"}
+    - {type: "flip", axis: 0}
+    - {type: "flip", axis: 1}
+    - {type: "flip", axis: 2}
+    - {type: "rot90", k: 1, axes: [1, 2]}
+    - {type: "rot90", k: 3, axes: [1, 2]}
