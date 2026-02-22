@@ -2,7 +2,7 @@ preprocess:
   preset_name: "brain"
   background_value: -5.0
   orient: "RAS"
-  target_spacing: [1.0, 1.0, 1.5]
+  target_spacing: [0.7, 0.7, 1.25]
   n4_bias_correction:
     shrink_factor: 2
     num_iters: [50, 50, 30, 20]
