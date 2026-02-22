@@ -77,6 +77,22 @@ train:
     enabled: true
     dice_weight: 1.0
     bce_weight: 1.0
+  volume_aware_loss:
+    enabled: true
+    min_fg_voxels: 50
+  oversampling:
+    enabled: true
+    method: "inverse_sqrt"   # options: "inverse_sqrt" | "inverse_log" | "uniform"
+    floor: 1.0
+    cap: 8.0
+    epoch_multiplier: 4
+
+metrics:
+  size_bins:
+    - { name: "tiny", min_vox: 0, max_vox: 50 }
+    - { name: "small", min_vox: 50, max_vox: 500 }
+    - { name: "medium", min_vox: 500, max_vox: 10000 }
+    - { name: "large", min_vox: 10000, max_vox: 1000000000 }
 
 validation:
   sw_overlap: 0.5

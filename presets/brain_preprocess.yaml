@@ -22,4 +22,4 @@ preprocess:
       fallback_to_simple: false
   intensity:
     clip_percentiles: [0.1, 99.9]
-    normalization_mode: "minmax"  # options: "zscore" | "minmax"
+    normalization_mode: "zscore"  # options: "zscore" | "minmax"

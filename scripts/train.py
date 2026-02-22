@@ -10,7 +10,7 @@ import wandb
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss, DiceFocalLoss, TverskyLoss
 from monai.transforms import Compose, EnsureTyped
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
@@ -22,7 +22,7 @@ from medseg.config import load_config
 from medseg.dataset import MedSegCachePatchDataset, extract_patch
 from medseg.dataset_volume import MedSegCacheVolumeDataset
 from medseg.io_registry import load_registry
-from medseg.losses import masked_dice_bce_loss
+from medseg.losses import masked_dice_bce_loss, masked_dice_bce_loss_volume_aware
 from medseg.metrics import (
     batch_lesion_recall_sum_count,
     batch_surface_dice_sum_count,
@@ -32,6 +32,11 @@ from medseg.models.brainiac_wrapper import BrainIACEncoder
 from medseg.models.seg_head import EncoderToSegModel
 from medseg.models.triad_backbones import TriadSwinEncoder, build_triad_plain_encoder
 from medseg.registry_build import ensure_training_registry
+from medseg.size_stratified_metrics import (
+    SizeStratifiedDiceAccumulator,
+    compute_case_sampling_weights,
+    parse_size_bins,
+)
 from medseg.utils import set_seed
 
 
@@ -442,13 +447,43 @@ def main(cfg_path: str):
     val_track_ds = MedSegCachePatchDataset(val_cases, cfg, transforms=val_track_tfms)
     fixed_track_x, fixed_track_y, fixed_track_uid = _prepare_fixed_tracking_patch(val_track_ds, device)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=int(cfg["train"]["batch_size"]),
-        shuffle=True,
-        num_workers=int(cfg["train"]["num_workers"]),
-        pin_memory=True,
-    )
+    oversample_cfg = cfg.get("train", {}).get("oversampling", {})
+    if bool(oversample_cfg.get("enabled", False)):
+        sample_weights = compute_case_sampling_weights(
+            train_cases,
+            cfg,
+            cache_dir=cfg["cache"]["cache_dir"],
+            method=str(oversample_cfg.get("method", "inverse_sqrt")),
+            floor=float(oversample_cfg.get("floor", 1.0)),
+            cap=float(oversample_cfg.get("cap", 8.0)),
+        )
+        epoch_mult = max(1, int(oversample_cfg.get("epoch_multiplier", 4)))
+        num_samples = len(train_cases) * epoch_mult
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=int(num_samples),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=int(cfg["train"]["batch_size"]),
+            sampler=sampler,
+            num_workers=int(cfg["train"]["num_workers"]),
+            pin_memory=True,
+        )
+        print(
+            f"[oversampling] enabled method={oversample_cfg.get('method', 'inverse_sqrt')} "
+            f"epoch_mult={epoch_mult} num_samples={num_samples} "
+            f"weights_range=[{min(sample_weights):.2f}, {max(sample_weights):.2f}]"
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=int(cfg["train"]["batch_size"]),
+            shuffle=True,
+            num_workers=int(cfg["train"]["num_workers"]),
+            pin_memory=True,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=1,
@@ -474,6 +509,9 @@ def main(cfg_path: str):
     use_masked_loss = bool(masked_loss_cfg.get("enabled", True))
     masked_dice_weight = float(masked_loss_cfg.get("dice_weight", 1.0))
     masked_bce_weight = float(masked_loss_cfg.get("bce_weight", 1.0))
+    vol_aware_cfg = cfg.get("train", {}).get("volume_aware_loss", {})
+    use_volume_aware = bool(vol_aware_cfg.get("enabled", False))
+    min_fg_voxels = int(vol_aware_cfg.get("min_fg_voxels", 50))
     if use_masked_loss:
         loss_name = "masked_dice_bce"
     train_dice_metric = make_dice_metric(include_background=False, reduction="mean")
@@ -580,13 +618,23 @@ def main(cfg_path: str):
                         y_ds = F.interpolate(y, size=logits_ds.shape[-3:], mode="nearest")
                         w_ds = F.interpolate(w, size=logits_ds.shape[-3:], mode="nearest")
                     if use_masked_loss:
-                        ds_loss = masked_dice_bce_loss(
-                            logits_ds,
-                            y_ds,
-                            w_ds,
-                            dice_weight=masked_dice_weight,
-                            bce_weight=masked_bce_weight,
-                        )
+                        if use_volume_aware:
+                            ds_loss = masked_dice_bce_loss_volume_aware(
+                                logits_ds,
+                                y_ds,
+                                w_ds,
+                                dice_weight=masked_dice_weight,
+                                bce_weight=masked_bce_weight,
+                                min_fg_voxels=min_fg_voxels,
+                            )
+                        else:
+                            ds_loss = masked_dice_bce_loss(
+                                logits_ds,
+                                y_ds,
+                                w_ds,
+                                dice_weight=masked_dice_weight,
+                                bce_weight=masked_bce_weight,
+                            )
                     else:
                         ds_loss = loss_fn(logits_ds, y_ds)
                     loss = loss + float(ds_weight) * ds_loss
@@ -632,6 +680,8 @@ def main(cfg_path: str):
         val_surface_n = 0
         val_lesion_sum = 0.0
         val_lesion_n = 0
+        size_bins = parse_size_bins(cfg)
+        strat_acc = SizeStratifiedDiceAccumulator(bins=size_bins)
         printed_val_batch_info = False
         with torch.no_grad():
             for batch in val_loader:
@@ -677,6 +727,15 @@ def main(cfg_path: str):
                 val_lesion_n += int(lrec_n)
                 val_gt_fg_vox += int(y_masked.sum().item())
                 val_total_vox += int(brain_weight.sum().item())
+                pred_np = pred_for_reporting_masked.detach().cpu().numpy()
+                y_np = y_masked.detach().cpu().numpy()
+                w_np = brain_weight.detach().cpu().numpy() if brain_weight is not None else None
+                for bidx in range(pred_np.shape[0]):
+                    strat_acc.update(
+                        pred_binary=pred_np[bidx, 0],
+                        target_binary=y_np[bidx, 0],
+                        mask=None if w_np is None else w_np[bidx, 0],
+                    )
                 if track_batch is None:
                     track_batch = (
                         x.detach().cpu(),
@@ -709,6 +768,7 @@ def main(cfg_path: str):
         pred_fg_ratio = float(val_pred_fg_vox / max(1, val_total_vox))
         gt_fg_ratio = float(val_gt_fg_vox / max(1, val_total_vox))
         pred_to_gt_fg = float(val_pred_fg_vox / max(1, val_gt_fg_vox))
+        strat_metrics = strat_acc.aggregate()
 
         log_payload = {
             "epoch": epoch,
@@ -730,6 +790,7 @@ def main(cfg_path: str):
             "train/lr_encoder": float(optimizer.param_groups[0]["lr"]),
             "train/lr_head": float(optimizer.param_groups[-1]["lr"]),
         }
+        log_payload.update(strat_metrics)
         for thr, score in val_dice_by_thr.items():
             log_payload[f"val/dice@{thr:.2f}"] = float(score)
         if track_batch is not None:

@@ -150,6 +150,10 @@ class MedSegCachePatchDataset(Dataset):
     def __len__(self):
         return len(self.cases)
 
+    def case_uid_for_index(self, idx: int) -> str:
+        # Stable mapping used with samplers that index by dataset row.
+        return str(self.cases[int(idx)].uid)
+
     def _get_cached(self, case: CaseItem):
         cache_key = case_cache_key(case, self.cfg)
         npz_path = os.path.join(self.cache_dir, f"{cache_key}.npz")
