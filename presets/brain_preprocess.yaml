@@ -1,6 +1,6 @@
 preprocess:
   preset_name: "brain"
-  background_value: -5.0
+  background_value: 0.0
   orient: "RAS"
   target_spacing: [0.7, 0.7, 1.25]
   n4_bias_correction:
@@ -10,7 +10,7 @@ preprocess:
     enabled: true
     margin_vox: 8
     apply_brain_mask: true
-    background_value: -5.0
+    background_value: 0.0
     brain_mask:
       method: "hdbet"
       hdbet_cmd: "hd-bet"

@@ -23,7 +23,7 @@ from medseg.calibration import (
     voxelwise_ece,
 )
 from medseg.config import load_config
-from medseg.dataset import case_cache_key, load_npz, save_npz
+from medseg.dataset import brain_mask_from_zscored, case_cache_key, load_npz, save_npz
 from medseg.io_registry import load_registry
 from medseg.preprocess import load_and_preprocess_with_steps
 from medseg.registry_build import ensure_training_registry
@@ -72,12 +72,12 @@ def _load_or_cache_case(case, cfg: dict):
     cache_key = case_cache_key(case, cfg)
     npz_path = os.path.join(cache_dir, f"{cache_key}.npz")
     if os.path.exists(npz_path) and not cfg["cache"]["overwrite"]:
-        image, label, spacing, _brain = load_npz(npz_path)
-        return image, label, spacing
+        image, label, spacing, brain = load_npz(npz_path)
+        return image, label, spacing, brain
 
     image, label, spacing, _, brain = load_and_preprocess_with_steps(case.image_path, case.mask_path, cfg)
     save_npz(npz_path, image, label, spacing, brain)
-    return image, label, spacing
+    return image, label, spacing, brain
 
 
 def _run_prediction(
@@ -196,9 +196,12 @@ def main():
     err_samples = []
 
     for step, case in enumerate(tqdm(cases)):
-        image, label, _ = _load_or_cache_case(case, cfg)
+        image, label, _, brain = _load_or_cache_case(case, cfg)
+        if brain is None:
+            brain = brain_mask_from_zscored(image[0])
         x = torch.from_numpy(image[None]).to(device)
-        target = torch.from_numpy(label).float()
+        brain_mask = torch.from_numpy((brain > 0).astype(np.float32)[None, ...])
+        target = torch.from_numpy(label).float() * brain_mask
 
         pred = _run_prediction(
             method=method,
@@ -209,10 +212,10 @@ def main():
             mc_n=mc_n,
             amp=amp,
         )
-        prob = pred["prob"].detach().cpu()  # (1,Z,Y,X)
+        prob = pred["prob"].detach().cpu() * brain_mask  # (1,Z,Y,X)
         unc = pred["unc"].detach().cpu()  # (1,Z,Y,X)
 
-        cal = voxelwise_ece(prob=prob, target=target, n_bins=args.n_bins, mask=None)
+        cal = voxelwise_ece(prob=prob, target=target, n_bins=args.n_bins, mask=brain_mask)
         cal_items.append(cal)
         case_ece.append(cal.ece)
         case_mce.append(cal.mce)
@@ -226,8 +229,9 @@ def main():
         if method != "none":
             pred_bin = (prob > 0.5).float()
             error = (pred_bin != target).float()
-            unc_flat = unc.view(-1).numpy()
-            err_flat = error.view(-1).numpy()
+            in_brain = (brain_mask.view(-1) > 0.5).numpy()
+            unc_flat = unc.view(-1).numpy()[in_brain]
+            err_flat = error.view(-1).numpy()[in_brain]
             if len(unc_flat) > args.max_curve_voxels:
                 sel = np.random.choice(len(unc_flat), size=args.max_curve_voxels, replace=False)
                 unc_flat = unc_flat[sel]

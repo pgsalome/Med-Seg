@@ -121,7 +121,7 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
     train_ds = MedSegCachePatchDataset(train_cases, cfg, transforms=train_tfms)
     val_ds = MedSegCacheVolumeDataset(val_cases, cfg, transforms=val_tfms)
     val_track_ds = MedSegCachePatchDataset(val_cases, cfg, transforms=val_track_tfms)
-    fixed_track_x, fixed_track_y, fixed_track_uid = _prepare_fixed_tracking_patch(val_track_ds, device)
+    fixed_track_x, fixed_track_y, fixed_track_w, fixed_track_uid = _prepare_fixed_tracking_patch(val_track_ds, device)
 
     oversample_cfg = cfg.get("train", {}).get("oversampling", {})
     if bool(oversample_cfg.get("enabled", False)):
@@ -422,12 +422,13 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
                     track_batch = (
                         x.detach().cpu(),
                         y.detach().cpu(),
-                        pred_for_reporting.detach().cpu(),
+                        pred_for_reporting_masked.detach().cpu(),
                     )
 
-        if fixed_track_x is not None and fixed_track_y is not None:
+        if fixed_track_x is not None and fixed_track_y is not None and fixed_track_w is not None:
             with torch.no_grad():
                 fixed_pred = (torch.sigmoid(model(fixed_track_x)) > 0.5).float()
+                fixed_pred = fixed_pred * (fixed_track_w > 0.5).float()
             track_batch = (
                 fixed_track_x.detach().cpu(),
                 fixed_track_y.detach().cpu(),
@@ -566,7 +567,7 @@ def run_fold(cfg: dict, fold_idx: int, train_cases: List[CaseItem], val_cases: L
     }
 
 
-def main(cfg_path: str, folds: int = 5):
+def main(cfg_path: str, folds: int = 3):
     cfg = load_config(cfg_path)
     cfg = ensure_training_registry(cfg, cfg_path)
     set_seed(int(cfg["seed"]))
@@ -747,6 +748,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg", required=True)
-    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--folds", type=int, default=3)
     args = parser.parse_args()
     main(args.cfg, folds=args.folds)

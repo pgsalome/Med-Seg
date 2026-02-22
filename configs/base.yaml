@@ -114,3 +114,9 @@ model:
 
 output:
   checkpoint_dir: "checkpoints"
+
+optuna:
+  num_gpus: 1
+  gpu_ids: null         # optional explicit list, e.g. [0,1,2]
+  study_name: "medseg_optuna_triad_plain"
+  storage: null         # optional, e.g. "sqlite:///checkpoints/optuna_study.db"

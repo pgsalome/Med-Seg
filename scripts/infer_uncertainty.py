@@ -16,7 +16,7 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from medseg.config import load_config
-from medseg.dataset import case_cache_key, load_npz, save_npz
+from medseg.dataset import brain_mask_from_zscored, case_cache_key, load_npz, save_npz
 from medseg.io_registry import load_registry
 from medseg.preprocess import load_and_preprocess_with_steps
 from medseg.registry_build import ensure_training_registry
@@ -74,12 +74,12 @@ def _load_or_cache_case(case, cfg: dict):
     npz_path = os.path.join(cache_dir, f"{cache_key}.npz")
 
     if os.path.exists(npz_path) and not cfg["cache"]["overwrite"]:
-        image, label, spacing, _brain = load_npz(npz_path)
-        return image, label, spacing, cache_key
+        image, label, spacing, brain = load_npz(npz_path)
+        return image, label, spacing, brain, cache_key
 
     image, label, spacing, _, brain = load_and_preprocess_with_steps(case.image_path, case.mask_path, cfg)
     save_npz(npz_path, image, label, spacing, brain)
-    return image, label, spacing, cache_key
+    return image, label, spacing, brain, cache_key
 
 
 def _select_cases(cases, uid: Optional[str], uids_file: Optional[str]):
@@ -176,7 +176,11 @@ def main():
 
     summary = []
     for step, case in enumerate(tqdm(cases)):
-        image, label, spacing, _cache_key = _load_or_cache_case(case, cfg)
+        image, label, spacing, brain, _cache_key = _load_or_cache_case(case, cfg)
+        if brain is None:
+            brain = brain_mask_from_zscored(image[0])
+        brain_1zyx = (brain > 0).astype(np.float32)[None, ...]
+        brain_t = torch.from_numpy(brain_1zyx)
         x = torch.from_numpy(image[None]).to(device)
 
         result = _predict(
@@ -192,21 +196,33 @@ def main():
         case_dir = os.path.join(out_dir, case.uid.replace("/", "_"))
         os.makedirs(case_dir, exist_ok=True)
 
-        prob_mean = result.prob_mean.detach().cpu().numpy()
-        unc_entropy = result.entropy.detach().cpu().numpy()
-        unc_var = result.var.detach().cpu().numpy()
+        prob_mean_t = result.prob_mean.detach().cpu() * brain_t
+        unc_entropy_t = result.entropy.detach().cpu()
+        unc_var_t = result.var.detach().cpu()
+        if result.mutual_info is not None:
+            unc_mi_t = result.mutual_info.detach().cpu()
+        else:
+            unc_mi_t = None
+        if result.prob_samples is not None:
+            prob_samples_t = result.prob_samples.detach().cpu() * brain_t[None, ...]
+        else:
+            prob_samples_t = None
+
+        prob_mean = prob_mean_t.numpy()
+        unc_entropy = unc_entropy_t.numpy()
+        unc_var = unc_var_t.numpy()
 
         np.save(os.path.join(case_dir, "prob_mean.npy"), prob_mean)
         np.save(os.path.join(case_dir, "unc_entropy.npy"), unc_entropy)
         np.save(os.path.join(case_dir, "unc_var.npy"), unc_var)
-        if result.mutual_info is not None:
-            np.save(os.path.join(case_dir, "unc_mi.npy"), result.mutual_info.detach().cpu().numpy())
-        if result.prob_samples is not None:
-            np.save(os.path.join(case_dir, "prob_samples.npy"), result.prob_samples.detach().cpu().numpy())
+        if unc_mi_t is not None:
+            np.save(os.path.join(case_dir, "unc_mi.npy"), unc_mi_t.numpy())
+        if prob_samples_t is not None:
+            np.save(os.path.join(case_dir, "prob_samples.npy"), prob_samples_t.numpy())
 
         comps = summarize_component_uncertainty(
-            prob_mean=result.prob_mean,
-            unc_map=result.entropy,
+            prob_mean=prob_mean_t,
+            unc_map=unc_entropy_t,
             threshold=0.5,
             min_voxels=10,
         )
@@ -226,7 +242,7 @@ def main():
             float(unc_entropy[0][pred_mask].mean()) if pred_mask.any() else 0.0
         )
         if result.mutual_info is not None:
-            scalar_log["unc/mi_mean"] = float(result.mutual_info.detach().cpu().mean().item())
+            scalar_log["unc/mi_mean"] = float(unc_mi_t.mean().item())
 
         if args.wandb:
             wandb_log_mid_slices(
@@ -269,8 +285,8 @@ def main():
                 "entropy_mean": float(unc_entropy.mean()),
                 "var_mean": float(unc_var.mean()),
                 "num_components": int(len(comps)),
-                "mi_mean": float(result.mutual_info.detach().cpu().mean().item())
-                if result.mutual_info is not None
+                "mi_mean": float(unc_mi_t.mean().item())
+                if unc_mi_t is not None
                 else None,
             }
         )

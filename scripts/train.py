@@ -19,7 +19,7 @@ if SRC not in sys.path:
 
 from medseg.augment import build_train_transforms
 from medseg.config import load_config
-from medseg.dataset import MedSegCachePatchDataset, extract_patch
+from medseg.dataset import MedSegCachePatchDataset, brain_mask_from_zscored, extract_patch
 from medseg.dataset_volume import MedSegCacheVolumeDataset
 from medseg.io_registry import load_registry
 from medseg.losses import masked_dice_bce_loss, masked_dice_bce_loss_volume_aware
@@ -85,9 +85,9 @@ def _prepare_fixed_tracking_patch(val_ds: MedSegCachePatchDataset, device: torch
 
     first_item = None
     for case in val_ds.cases:
-        img_czyx, lab_czyx, _, _ = val_ds._get_cached(case)
+        img_czyx, lab_czyx, _, brain_cached = val_ds._get_cached(case)
         if first_item is None:
-            first_item = (case, img_czyx, lab_czyx)
+            first_item = (case, img_czyx, lab_czyx, brain_cached)
 
         center = _centroid_from_mask(lab_czyx[0])
         x_patch = extract_patch(img_czyx, center, patch_size)
@@ -96,18 +96,30 @@ def _prepare_fixed_tracking_patch(val_ds: MedSegCachePatchDataset, device: torch
         if float(y_patch.sum()) > 0.0:
             x_t = torch.from_numpy(x_patch[None]).to(device)
             y_t = torch.from_numpy(y_patch[None]).to(device)
-            return x_t, y_t, case.uid
+            if brain_cached is None:
+                brain_zyx = brain_mask_from_zscored(img_czyx[0])
+            else:
+                brain_zyx = (brain_cached > 0).astype(np.uint8)
+            w_patch = extract_patch(brain_zyx[None, ...].astype(np.float32), center, patch_size)
+            w_t = torch.from_numpy(w_patch[None]).to(device)
+            return x_t, y_t, w_t, case.uid
 
     if first_item is None:
-        return None, None, None
+        return None, None, None, None
 
-    case, img_czyx, lab_czyx = first_item
+    case, img_czyx, lab_czyx, brain_cached = first_item
     center = _centroid_from_mask(lab_czyx[0])
     x_patch = extract_patch(img_czyx, center, patch_size)
     y_patch = extract_patch(lab_czyx.astype(np.float32), center, patch_size)
     x_t = torch.from_numpy(x_patch[None]).to(device)
     y_t = torch.from_numpy(y_patch[None]).to(device)
-    return x_t, y_t, case.uid
+    if brain_cached is None:
+        brain_zyx = brain_mask_from_zscored(img_czyx[0])
+    else:
+        brain_zyx = (brain_cached > 0).astype(np.uint8)
+    w_patch = extract_patch(brain_zyx[None, ...].astype(np.float32), center, patch_size)
+    w_t = torch.from_numpy(w_patch[None]).to(device)
+    return x_t, y_t, w_t, case.uid
 
 
 def _build_tracking_overlays(
@@ -445,7 +457,7 @@ def main(cfg_path: str):
     val_ds = MedSegCacheVolumeDataset(val_cases, cfg, transforms=val_tfms)
     # Keep deterministic patch overlays for tracking while using full-volume validation.
     val_track_ds = MedSegCachePatchDataset(val_cases, cfg, transforms=val_track_tfms)
-    fixed_track_x, fixed_track_y, fixed_track_uid = _prepare_fixed_tracking_patch(val_track_ds, device)
+    fixed_track_x, fixed_track_y, fixed_track_w, fixed_track_uid = _prepare_fixed_tracking_patch(val_track_ds, device)
 
     oversample_cfg = cfg.get("train", {}).get("oversampling", {})
     if bool(oversample_cfg.get("enabled", False)):
@@ -740,12 +752,13 @@ def main(cfg_path: str):
                     track_batch = (
                         x.detach().cpu(),
                         y.detach().cpu(),
-                        pred_for_reporting.detach().cpu(),
+                        pred_for_reporting_masked.detach().cpu(),
                     )
 
-        if fixed_track_x is not None and fixed_track_y is not None:
+        if fixed_track_x is not None and fixed_track_y is not None and fixed_track_w is not None:
             with torch.no_grad():
                 fixed_pred = (torch.sigmoid(model(fixed_track_x)) > 0.5).float()
+                fixed_pred = fixed_pred * (fixed_track_w > 0.5).float()
             track_batch = (
                 fixed_track_x.detach().cpu(),
                 fixed_track_y.detach().cpu(),

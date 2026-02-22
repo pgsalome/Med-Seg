@@ -400,4 +400,5 @@ class MedSegCachePatchDataset(Dataset):
         }
         if self.transforms is not None:
             sample = self.transforms(sample)
+        sample["image"] = sample["image"] * (sample["weight"] > 0.5).float()
         return sample
